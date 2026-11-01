@@ -1,0 +1,27 @@
+// A small server with one tool, one resource and one prompt. Try it with:
+//   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | build/echo
+import "../src/mcp.ab"
+
+fun main: int {
+    val server = mcpServer("echo", "0.1.0", "Echoes text back.")
+    server.tool(
+        "echo",
+        "Returns the text it is given",
+        mcpSchema(
+            ["text"], [mcpProperty("string", "What to echo")], ["text"]
+        ),
+        { arguments: Json -> mcpText(arguments.getString("text")) }
+    )
+    server.addResource(
+        "echo://greeting", "greeting", "A greeting", "text/plain",
+        { uri: string -> McpResourceContents(uri, "text/plain", "hello", true) }
+    )
+    server.prompt(
+        "shout", "Asks for text in capitals",
+        [McpPromptArgument("text", "What to shout", true)],
+        { arguments: Json ->
+            [McpPromptMessage("user", "Shout: ${arguments.getString("text")}")]
+        }
+    )
+    mcpStdio(server).run()
+}

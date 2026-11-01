@@ -1,0 +1,652 @@
+// Model Context Protocol server library for Abla. The protocol core turns one
+// JSON-RPC message into its reply and does no I/O, so any transport can drive
+// it; the stdio transport below can be polled next to other descriptors.
+
+import "abla/json"
+import "abla/sys/linux/io"
+import "abla/sys/linux/net"
+
+val mcpParseError = -32700
+val mcpInvalidRequest = -32600
+val mcpMethodNotFound = -32601
+val mcpInvalidParams = -32602
+val mcpInternalError = -32603
+val mcpResourceNotFound = -32002
+val mcpMaximumLineBytes = 16777216
+
+class McpContent(
+    val kind: string,
+    val text: string,
+    val data: string,
+    val mimeType: string
+)
+
+class McpToolResult(
+    val content: array<McpContent>,
+    val structured: Json,
+    val isError: bool
+)
+
+class McpTool(
+    val name: string,
+    val description: string,
+    val inputSchema: Json,
+    val handler: (Json) -> McpToolResult
+)
+
+class McpResourceContents(
+    val uri: string,
+    val mimeType: string,
+    val text: string,
+    val found: bool
+)
+
+class McpResource(
+    val uri: string,
+    val name: string,
+    val description: string,
+    val mimeType: string,
+    val reader: (string) -> McpResourceContents
+)
+
+class McpPromptArgument(
+    val name: string,
+    val description: string,
+    val required: bool
+)
+
+class McpPromptMessage(val role: string, val text: string)
+
+class McpPrompt(
+    val name: string,
+    val description: string,
+    val arguments: array<McpPromptArgument>,
+    val render: (Json) -> array<McpPromptMessage>
+)
+
+class McpNotificationHandler(
+    val method: string,
+    val handler: (Json) -> void
+)
+
+class McpServer(
+    val name: string,
+    val version: string,
+    val instructions: string,
+    val experimental: array<string>,
+    val tools: array<McpTool>,
+    val resources: array<McpResource>,
+    val prompts: array<McpPrompt>,
+    val notifications: array<McpNotificationHandler>,
+    var initialized: bool,
+    var negotiatedVersion: string,
+    var clientName: string,
+    var clientVersion: string,
+    var logLevel: int,
+    var nextRequest: int,
+    var writer: (string) -> bool
+)
+
+fun mcpProtocolVersions(): array<string> =
+    ["2025-06-18", "2025-03-26", "2024-11-05"]
+
+fun mcpServer(
+    name: string,
+    version: string,
+    instructions: string = "",
+    experimental: array<string> = []
+): McpServer = McpServer(
+    name, version, instructions, experimental, [], [], [], [],
+    false, "", "", "", 8, 1, { line: string -> mcpWriteStdout(line) }
+)
+
+fun mcpText(text: string): McpToolResult =
+    McpToolResult([McpContent("text", text, "", "")], jsonNull(), false)
+
+fun mcpImage(data: string, mimeType: string): McpToolResult =
+    McpToolResult([McpContent("image", "", data, mimeType)], jsonNull(), false)
+
+fun mcpError(text: string): McpToolResult =
+    McpToolResult([McpContent("text", text, "", "")], jsonNull(), true)
+
+// The text carries the JSON too, for clients without structured output.
+fun mcpStructured(value: Json): McpToolResult = McpToolResult(
+    [McpContent("text", jsonStringify(value), "", "")], value, false
+)
+
+// Schema helpers for the common shape: an object of named properties.
+fun mcpProperty(kind: string, description: string): Json = jsonObject(
+    ["type", "description"], [jsonString(kind), jsonString(description)]
+)
+
+fun mcpSchema(
+    names: array<string> = [],
+    properties: array<Json> = [],
+    required: array<string> = []
+): Json {
+    val requiredValues: array<Json> = []
+    var index = 0
+    while (index < required.size) {
+        requiredValues.append(jsonString(required[index]))
+        index = index + 1
+    }
+    jsonObject(
+        ["type", "properties", "required"],
+        [
+            jsonString("object"),
+            jsonObject(names, properties),
+            jsonArray(requiredValues)
+        ]
+    )
+}
+
+fun McpServer.tool(
+    name: string,
+    description: string,
+    inputSchema: Json,
+    handler: (Json) -> McpToolResult
+): borrow(this) McpServer {
+    this.tools.append(McpTool(name, description, inputSchema, handler))
+    this
+}
+
+fun McpServer.addResource(
+    uri: string,
+    name: string,
+    description: string,
+    mimeType: string,
+    reader: (string) -> McpResourceContents
+): borrow(this) McpServer {
+    this.resources.append(McpResource(uri, name, description, mimeType, reader))
+    this
+}
+
+fun McpServer.prompt(
+    name: string,
+    description: string,
+    arguments: array<McpPromptArgument>,
+    render: (Json) -> array<McpPromptMessage>
+): borrow(this) McpServer {
+    this.prompts.append(McpPrompt(name, description, arguments, render))
+    this
+}
+
+// Runs for a notification from the client; `notifications/initialized` and
+// `notifications/cancelled` are understood already.
+fun McpServer.onNotification(
+    method: string,
+    handler: (Json) -> void
+): borrow(this) McpServer {
+    this.notifications.append(McpNotificationHandler(method, handler))
+    this
+}
+
+private fun mcpReply(id: Json, result: Json): string = jsonStringify(jsonObject(
+    ["jsonrpc", "id", "result"], [jsonString("2.0"), id, result]
+))
+
+private fun mcpFailure(id: Json, code: int, message: string): string =
+    jsonStringify(jsonObject(
+        ["jsonrpc", "id", "error"],
+        [
+            jsonString("2.0"),
+            id,
+            jsonObject(
+                ["code", "message"], [jsonInteger(code), jsonString(message)]
+            )
+        ]
+    ))
+
+private fun mcpProtocolSupported(version: string): bool {
+    val versions = mcpProtocolVersions()
+    var found = false
+    var index = 0
+    while (index < versions.size) {
+        if (versions[index] == version) found = true
+        index = index + 1
+    }
+    found
+}
+
+private fun McpServer.capabilities(): Json {
+    val keys: array<string> = []
+    val values: array<Json> = []
+    keys.append("logging")
+    values.append(jsonObject([], []))
+    if (this.tools.size > 0) {
+        keys.append("tools")
+        values.append(jsonObject(["listChanged"], [jsonBoolean(true)]))
+    }
+    if (this.resources.size > 0) {
+        keys.append("resources")
+        values.append(jsonObject(["listChanged"], [jsonBoolean(true)]))
+    }
+    if (this.prompts.size > 0) {
+        keys.append("prompts")
+        values.append(jsonObject(["listChanged"], [jsonBoolean(true)]))
+    }
+    if (this.experimental.size > 0) {
+        val features: array<Json> = []
+        var index = 0
+        while (index < this.experimental.size) {
+            features.append(jsonObject([], []))
+            index = index + 1
+        }
+        keys.append("experimental")
+        values.append(jsonObject(this.experimental, features))
+    }
+    jsonObject(keys, values)
+}
+
+private fun McpServer.initialize(id: Json, params: Json): string {
+    val requested = params.getString("protocolVersion")
+    this.negotiatedVersion =
+        if (mcpProtocolSupported(requested)) requested
+        else mcpProtocolVersions()[0]
+    val client = params.get("clientInfo")
+    this.clientName = client.getString("name")
+    this.clientVersion = client.getString("version")
+    val keys = ["protocolVersion", "capabilities", "serverInfo"]
+    val values = [
+        jsonString(this.negotiatedVersion),
+        this.capabilities(),
+        jsonObject(
+            ["name", "version"],
+            [jsonString(this.name), jsonString(this.version)]
+        )
+    ]
+    if (this.instructions != "") {
+        keys.append("instructions")
+        values.append(jsonString(this.instructions))
+    }
+    mcpReply(id, jsonObject(keys, values))
+}
+
+private fun mcpContentJson(content: McpContent): Json =
+    if (content.kind == "text") jsonObject(
+        ["type", "text"], [jsonString("text"), jsonString(content.text)]
+    ) else jsonObject(
+        ["type", "data", "mimeType"],
+        [
+            jsonString(content.kind),
+            jsonString(content.data),
+            jsonString(content.mimeType)
+        ]
+    )
+
+private fun mcpToolResultJson(result: McpToolResult): Json {
+    val content: array<Json> = []
+    var index = 0
+    while (index < result.content.size) {
+        content.append(mcpContentJson(result.content[index]))
+        index = index + 1
+    }
+    val keys = ["content", "isError"]
+    val values = [jsonArray(content), jsonBoolean(result.isError)]
+    if (!result.structured.isNull()) {
+        keys.append("structuredContent")
+        values.append(result.structured)
+    }
+    jsonObject(keys, values)
+}
+
+private fun McpServer.listTools(id: Json): string {
+    val listed: array<Json> = []
+    var index = 0
+    while (index < this.tools.size) {
+        val tool = this.tools[index]
+        listed.append(jsonObject(
+            ["name", "description", "inputSchema"],
+            [
+                jsonString(tool.name),
+                jsonString(tool.description),
+                tool.inputSchema
+            ]
+        ))
+        index = index + 1
+    }
+    mcpReply(id, jsonObject(["tools"], [jsonArray(listed)]))
+}
+
+private fun McpServer.callTool(id: Json, params: Json): string {
+    val name = params.getString("name")
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.tools.size) {
+        if (this.tools[index].name == name) found = index
+        index = index + 1
+    }
+    if (found < 0) {
+        mcpFailure(id, mcpInvalidParams, "Unknown tool: $name")
+    } else {
+        val handler = this.tools[found].handler
+        mcpReply(id, mcpToolResultJson(handler(params.get("arguments"))))
+    }
+}
+
+private fun McpServer.listResources(id: Json): string {
+    val listed: array<Json> = []
+    var index = 0
+    while (index < this.resources.size) {
+        val entry = this.resources[index]
+        listed.append(jsonObject(
+            ["uri", "name", "description", "mimeType"],
+            [
+                jsonString(entry.uri),
+                jsonString(entry.name),
+                jsonString(entry.description),
+                jsonString(entry.mimeType)
+            ]
+        ))
+        index = index + 1
+    }
+    mcpReply(id, jsonObject(["resources"], [jsonArray(listed)]))
+}
+
+private fun McpServer.readResource(id: Json, params: Json): string {
+    val uri = params.getString("uri")
+    var contents = McpResourceContents(uri, "", "", false)
+    var index = 0
+    while (!contents.found && index < this.resources.size) {
+        if (this.resources[index].uri == uri) {
+            val reader = this.resources[index].reader
+            contents = reader(uri)
+        }
+        index = index + 1
+    }
+    if (!contents.found) {
+        mcpFailure(id, mcpResourceNotFound, "Resource not found: $uri")
+    } else {
+        mcpReply(id, jsonObject(
+            ["contents"],
+            [jsonArray([jsonObject(
+                ["uri", "mimeType", "text"],
+                [
+                    jsonString(contents.uri),
+                    jsonString(contents.mimeType),
+                    jsonString(contents.text)
+                ]
+            )])]
+        ))
+    }
+}
+
+private fun McpServer.listPrompts(id: Json): string {
+    val listed: array<Json> = []
+    var index = 0
+    while (index < this.prompts.size) {
+        val prompt = this.prompts[index]
+        val arguments: array<Json> = []
+        var position = 0
+        while (position < prompt.arguments.size) {
+            val argument = prompt.arguments[position]
+            arguments.append(jsonObject(
+                ["name", "description", "required"],
+                [
+                    jsonString(argument.name),
+                    jsonString(argument.description),
+                    jsonBoolean(argument.required)
+                ]
+            ))
+            position = position + 1
+        }
+        listed.append(jsonObject(
+            ["name", "description", "arguments"],
+            [
+                jsonString(prompt.name),
+                jsonString(prompt.description),
+                jsonArray(arguments)
+            ]
+        ))
+        index = index + 1
+    }
+    mcpReply(id, jsonObject(["prompts"], [jsonArray(listed)]))
+}
+
+private fun McpServer.getPrompt(id: Json, params: Json): string {
+    val name = params.getString("name")
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.prompts.size) {
+        if (this.prompts[index].name == name) found = index
+        index = index + 1
+    }
+    if (found < 0) {
+        mcpFailure(id, mcpInvalidParams, "Unknown prompt: $name")
+    } else {
+        val prompt = this.prompts[found]
+        val render = prompt.render
+        val rendered = render(params.get("arguments"))
+        val messages: array<Json> = []
+        var position = 0
+        while (position < rendered.size) {
+            messages.append(jsonObject(
+                ["role", "content"],
+                [
+                    jsonString(rendered[position].role),
+                    jsonObject(
+                        ["type", "text"],
+                        [jsonString("text"), jsonString(rendered[position].text)]
+                    )
+                ]
+            ))
+            position = position + 1
+        }
+        mcpReply(id, jsonObject(
+            ["description", "messages"],
+            [jsonString(prompt.description), jsonArray(messages)]
+        ))
+    }
+}
+
+private fun mcpLogSeverity(level: string): int {
+    val levels = [
+        "emergency", "alert", "critical", "error",
+        "warning", "notice", "info", "debug"
+    ]
+    var found = -1
+    var index = 0
+    while (index < levels.size) {
+        if (levels[index] == level) found = index
+        index = index + 1
+    }
+    found
+}
+
+private fun McpServer.setLogLevel(id: Json, params: Json): string {
+    val severity = mcpLogSeverity(params.getString("level"))
+    if (severity < 0) {
+        mcpFailure(id, mcpInvalidParams, "Unknown log level")
+    } else {
+        this.logLevel = severity
+        mcpReply(id, jsonObject([], []))
+    }
+}
+
+private fun McpServer.dispatchRequest(
+    id: Json,
+    method: string,
+    params: Json
+): string = when (method) {
+    "initialize" -> this.initialize(id, params)
+    "ping" -> mcpReply(id, jsonObject([], []))
+    "tools/list" -> this.listTools(id)
+    "tools/call" -> this.callTool(id, params)
+    "resources/list" -> this.listResources(id)
+    "resources/read" -> this.readResource(id, params)
+    "resources/templates/list" -> mcpReply(
+        id, jsonObject(["resourceTemplates"], [jsonArray([])])
+    )
+    "prompts/list" -> this.listPrompts(id)
+    "prompts/get" -> this.getPrompt(id, params)
+    "logging/setLevel" -> this.setLogLevel(id, params)
+    else -> mcpFailure(id, mcpMethodNotFound, "Method not found: $method")
+}
+
+private fun McpServer.dispatchNotification(
+    method: string,
+    params: Json
+): void {
+    if (method == "notifications/initialized") this.initialized = true
+    var index = 0
+    while (index < this.notifications.size) {
+        if (this.notifications[index].method == method) {
+            val handler = this.notifications[index].handler
+            handler(params)
+        }
+        index = index + 1
+    }
+    return
+}
+
+// The reply to one message, or "" when it wants none.
+fun McpServer.handle(line: string): string {
+    val parsed = jsonParse(line)
+    if (!parsed.succeeded) {
+        return mcpFailure(jsonNull(), mcpParseError, "Parse error")
+    }
+    val message = parsed.value
+    if (!message.isObject()) {
+        return mcpFailure(jsonNull(), mcpInvalidRequest, "Invalid request")
+    }
+    val hasId = message.has("id")
+    val id = message.get("id")
+    if (hasId && !id.isString() && !id.isNumber()) {
+        return mcpFailure(jsonNull(), mcpInvalidRequest, "Invalid request id")
+    }
+    if (message.has("method")) {
+        val method = message.get("method")
+        if (!method.isString() || message.getString("jsonrpc") != "2.0") {
+            return if (hasId) {
+                mcpFailure(id, mcpInvalidRequest, "Invalid request")
+            } else {
+                mcpFailure(jsonNull(), mcpInvalidRequest, "Invalid request")
+            }
+        }
+        if (hasId) {
+            return this.dispatchRequest(
+                id, method.asString(), message.get("params")
+            )
+        }
+        this.dispatchNotification(method.asString(), message.get("params"))
+        return ""
+    }
+    // A reply to something this server asked; nothing is waiting on it here.
+    if (hasId && (message.has("result") || message.has("error"))) return ""
+    mcpFailure(jsonNull(), mcpInvalidRequest, "Invalid request")
+}
+
+fun mcpNotificationLine(method: string, params: Json): string =
+    jsonStringify(jsonObject(
+        ["jsonrpc", "method", "params"],
+        [jsonString("2.0"), jsonString(method), params]
+    ))
+
+fun McpServer.notify(method: string, params: Json): bool {
+    val write = this.writer
+    write(mcpNotificationLine(method, params))
+}
+
+// Sends a request to the client and returns its id. The answer comes through
+// the transport and is ignored by `handle`.
+fun McpServer.request(method: string, params: Json): int {
+    val id = this.nextRequest
+    this.nextRequest = this.nextRequest + 1
+    val write = this.writer
+    write(jsonStringify(jsonObject(
+        ["jsonrpc", "id", "method", "params"],
+        [jsonString("2.0"), jsonInteger(id), jsonString(method), params]
+    )))
+    id
+}
+
+fun McpServer.log(level: string, logger: string, message: string): bool {
+    val severity = mcpLogSeverity(level)
+    if (severity < 0 || severity > this.logLevel) false
+    else this.notify("notifications/message", jsonObject(
+        ["level", "logger", "data"],
+        [jsonString(level), jsonString(logger), jsonString(message)]
+    ))
+}
+
+fun McpServer.toolsChanged(): bool =
+    this.notify("notifications/tools/list_changed", jsonObject([], []))
+
+fun McpServer.resourcesChanged(): bool =
+    this.notify("notifications/resources/list_changed", jsonObject([], []))
+
+fun McpServer.promptsChanged(): bool =
+    this.notify("notifications/prompts/list_changed", jsonObject([], []))
+
+// Claude Code's channel event: text that reaches the model of a session
+// started with the channel enabled.
+fun McpServer.channel(
+    content: string,
+    metaKeys: array<string> = [],
+    metaValues: array<string> = []
+): bool {
+    val values: array<Json> = []
+    var index = 0
+    while (index < metaValues.size) {
+        values.append(jsonString(metaValues[index]))
+        index = index + 1
+    }
+    this.notify("notifications/claude/channel", jsonObject(
+        ["content", "meta"],
+        [jsonString(content), jsonObject(metaKeys, values)]
+    ))
+}
+
+fun mcpWriteStdout(line: string): bool =
+    linuxWriteStandardOutputAll("$line\n")
+
+// Newline-delimited stdio. `descriptor` can go in a poller; call `pump` when
+// it is readable. A message split across reads waits in `pending`.
+class McpStdio(
+    val server: McpServer,
+    val descriptor: int,
+    var pending: string,
+    var ended: bool
+)
+
+fun mcpStdio(server: McpServer, descriptor: int = 0): McpStdio =
+    McpStdio(server, descriptor, "", false)
+
+// Feeds received bytes through the server, writing each reply.
+fun McpStdio.accept(chunk: string): void {
+    this.pending = "${this.pending}$chunk"
+    var start = 0
+    var index = 0
+    while (index < this.pending.size) {
+        if (this.pending[index] == 10) {
+            var end = index
+            if (end > start && this.pending[end - 1] == 13) end = end - 1
+            if (end > start) {
+                val reply = this.server.handle(this.pending.slice(start, end))
+                if (reply != "") {
+                    val write = this.server.writer
+                    write(reply)
+                }
+            }
+            start = index + 1
+        }
+        index = index + 1
+    }
+    this.pending = this.pending.slice(start, this.pending.size)
+    if (this.pending.size > mcpMaximumLineBytes) this.ended = true
+    return
+}
+
+// Reads once; false once the client has gone.
+fun McpStdio.pump(): bool {
+    val chunk = LinuxFileDescriptor(this.descriptor).read(65536)
+    if (chunk.size == 0) this.ended = true
+    else this.accept(chunk)
+    !this.ended
+}
+
+// Serves until the client closes stdin.
+fun McpStdio.run(): int {
+    while (this.pump()) {}
+    0
+}

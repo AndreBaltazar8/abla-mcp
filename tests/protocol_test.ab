@@ -1,0 +1,169 @@
+import "../src/mcp.ab"
+import "abla/test"
+
+fun request(id: int, method: string, params: string = "{}"): string =
+    "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+fun parsed(reply: string): Json = jsonParse(reply).value
+
+fun fixture(): McpServer {
+    val server = mcpServer("test", "1.2.3", "Use it well", ["claude/channel"])
+    server.writer = { line: string -> true }
+    server.tool(
+        "add", "Adds",
+        mcpSchema(
+            ["a", "b"],
+            [mcpProperty("integer", "first"), mcpProperty("integer", "second")],
+            ["a", "b"]
+        ),
+        { arguments: Json ->
+            mcpText("${arguments.getInt("a") + arguments.getInt("b")}")
+        }
+    )
+    server.tool("fail", "Fails", mcpSchema(), { arguments: Json -> mcpError("nope") })
+    server.tool(
+        "shape", "Structured", mcpSchema(),
+        { arguments: Json -> mcpStructured(jsonObject(["n"], [jsonInteger(7)])) }
+    )
+    server.addResource(
+        "x://one", "one", "One", "text/plain",
+        { uri: string -> McpResourceContents(uri, "text/plain", "body", true) }
+    )
+    server.prompt(
+        "hi", "Greets", [McpPromptArgument("who", "Whom", true)],
+        { arguments: Json ->
+            [McpPromptMessage("user", "hi ${arguments.getString("who")}")]
+        }
+    )
+    server
+}
+
+fun testInitialize(): void {
+    val server = fixture()
+    val reply = parsed(server.handle(request(1, "initialize",
+        "{\"protocolVersion\":\"2025-03-26\",\"clientInfo\":{\"name\":\"c\",\"version\":\"9\"},\"capabilities\":{}}"
+    ))).get("result")
+    expectEqual(reply.getString("protocolVersion"), "2025-03-26", "known version kept")
+    expectEqual(reply.get("serverInfo").getString("name"), "test", "server name")
+    expectEqual(reply.getString("instructions"), "Use it well", "instructions")
+    expect(reply.get("capabilities").has("tools"), "tools capability")
+    expect(reply.get("capabilities").has("resources"), "resources capability")
+    expect(reply.get("capabilities").has("prompts"), "prompts capability")
+    expect(reply.get("capabilities").get("experimental").has("claude/channel"), "experimental capability")
+    expectEqual(server.clientName, "c", "client recorded")
+    val newer = parsed(server.handle(request(2, "initialize",
+        "{\"protocolVersion\":\"2099-01-01\"}"
+    ))).get("result")
+    expectEqual(newer.getString("protocolVersion"), mcpProtocolVersions()[0], "unknown version answered with ours")
+    expect(!server.initialized, "not initialized before the notification")
+    expectEqual(server.handle("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"), "", "notification has no reply")
+    expect(server.initialized, "initialized after the notification")
+    return
+}
+
+fun testTools(): void {
+    val server = fixture()
+    val listed = parsed(server.handle(request(1, "tools/list"))).get("result").get("tools")
+    expectEqual(listed.size(), 3, "tools listed")
+    expectEqual(listed.at(0).get("inputSchema").getString("type"), "object", "schema kept")
+    val added = parsed(server.handle(request(2, "tools/call",
+        "{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":3}}"
+    ))).get("result")
+    expectEqual(added.get("content").at(0).getString("text"), "5", "tool ran")
+    expect(!added.get("isError").asBoolean(), "tool succeeded")
+    val failed = parsed(server.handle(request(3, "tools/call", "{\"name\":\"fail\"}"))).get("result")
+    expect(failed.get("isError").asBoolean(), "tool failure is a result")
+    val shaped = parsed(server.handle(request(4, "tools/call", "{\"name\":\"shape\"}"))).get("result")
+    expectEqual(shaped.get("structuredContent").getInt("n"), 7, "structured content")
+    val unknown = parsed(server.handle(request(5, "tools/call", "{\"name\":\"nope\"}")))
+    expectEqual(unknown.get("error").getInt("code"), mcpInvalidParams, "unknown tool")
+    return
+}
+
+fun testResourcesAndPrompts(): void {
+    val server = fixture()
+    val listed = parsed(server.handle(request(1, "resources/list"))).get("result")
+    expectEqual(listed.get("resources").at(0).getString("uri"), "x://one", "resource listed")
+    val read = parsed(server.handle(request(2, "resources/read", "{\"uri\":\"x://one\"}"))).get("result")
+    expectEqual(read.get("contents").at(0).getString("text"), "body", "resource read")
+    val missing = parsed(server.handle(request(3, "resources/read", "{\"uri\":\"x://no\"}")))
+    expectEqual(missing.get("error").getInt("code"), mcpResourceNotFound, "resource missing")
+    val templates = parsed(server.handle(request(4, "resources/templates/list"))).get("result")
+    expectEqual(templates.get("resourceTemplates").size(), 0, "no templates")
+    val prompts = parsed(server.handle(request(5, "prompts/list"))).get("result")
+    expect(prompts.get("prompts").at(0).get("arguments").at(0).get("required").asBoolean(), "prompt argument")
+    val prompt = parsed(server.handle(request(6, "prompts/get",
+        "{\"name\":\"hi\",\"arguments\":{\"who\":\"you\"}}"
+    ))).get("result")
+    expectEqual(prompt.get("messages").at(0).get("content").getString("text"), "hi you", "prompt rendered")
+    return
+}
+
+fun testErrors(): void {
+    val server = fixture()
+    expectEqual(parsed(server.handle("{nope")).get("error").getInt("code"), mcpParseError, "parse error")
+    expectEqual(parsed(server.handle("[]")).get("error").getInt("code"), mcpInvalidRequest, "array rejected")
+    expectEqual(parsed(server.handle("{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"ping\"}")).get("error").getInt("code"), mcpInvalidRequest, "object id rejected")
+    expectEqual(parsed(server.handle("{\"id\":1,\"method\":\"ping\"}")).get("error").getInt("code"), mcpInvalidRequest, "version required")
+    expectEqual(parsed(server.handle(request(1, "no/such"))).get("error").getInt("code"), mcpMethodNotFound, "method not found")
+    expectEqual(server.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"), "", "client answers ignored")
+    val text = parsed(server.handle("{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"ping\"}"))
+    expectEqual(text.getString("id"), "abc", "string id echoed")
+    return
+}
+
+fun testOutbound(): void {
+    val server = fixture()
+    val lines: array<string> = []
+    server.writer = { line: string ->
+        lines.append(line)
+        true
+    }
+    server.channel("hello", ["from"], ["ana"])
+    val channel = parsed(lines[0])
+    expectEqual(channel.getString("method"), "notifications/claude/channel", "channel method")
+    expectEqual(channel.get("params").getString("content"), "hello", "channel content")
+    expectEqual(channel.get("params").get("meta").getString("from"), "ana", "channel meta")
+    expect(!channel.has("id"), "notification has no id")
+    server.handle(request(1, "logging/setLevel", "{\"level\":\"warning\"}"))
+    expect(!server.log("info", "t", "quiet"), "below level dropped")
+    expect(server.log("error", "t", "loud"), "above level sent")
+    expectEqual(parsed(lines[1]).get("params").getString("data"), "loud", "log data")
+    expectEqual(parsed(server.handle(request(2, "logging/setLevel", "{\"level\":\"x\"}"))).get("error").getInt("code"), mcpInvalidParams, "bad level")
+    server.toolsChanged()
+    expectEqual(parsed(lines[2]).getString("method"), "notifications/tools/list_changed", "list changed")
+    expectEqual(server.request("roots/list", jsonObject([], [])), 1, "first request id")
+    expectEqual(server.request("roots/list", jsonObject([], [])), 2, "ids increase")
+    return
+}
+
+fun testFraming(): void {
+    val server = fixture()
+    val lines: array<string> = []
+    server.writer = { line: string ->
+        lines.append(line)
+        true
+    }
+    val stdio = mcpStdio(server)
+    stdio.accept("{\"jsonrpc\":\"2.0\",\"id\":1,")
+    expectEqual(lines.size, 0, "partial message waits")
+    stdio.accept("\"method\":\"ping\"}\r\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"a")
+    expectEqual(lines.size, 2, "two messages, blank line skipped")
+    expectEqual(parsed(lines[1]).getInt("id"), 2, "order kept")
+    expectEqual(stdio.pending, "{\"a", "remainder kept")
+    val seen: array<string> = []
+    server.onNotification("x/y", { params: Json -> seen.append(params.getString("v")) })
+    stdio.accept("\"\":1}\n{\"jsonrpc\":\"2.0\",\"method\":\"x/y\",\"params\":{\"v\":\"é\"}}\n")
+    expectEqual(seen[0], "é", "notification handler, UTF-8 intact")
+    return
+}
+
+fun main: int {
+    testInitialize()
+    testTools()
+    testResourcesAndPrompts()
+    testErrors()
+    testOutbound()
+    testFraming()
+    testsPassed()
+}
