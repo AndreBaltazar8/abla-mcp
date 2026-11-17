@@ -1,6 +1,7 @@
 // A small server with one tool, one resource and one prompt. Try it with:
 //   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | build/echo
 import "../src/mcp.ab"
+import "abla/json"
 
 fun main: int {
     val server = mcpServer("echo", "0.1.0", "Echoes text back.")

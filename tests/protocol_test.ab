@@ -1,5 +1,6 @@
 import "../src/mcp.ab"
 import "abla/test"
+import "abla/json"
 
 fun request(id: int, method: string, params: string = "{}"): string =
     "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
